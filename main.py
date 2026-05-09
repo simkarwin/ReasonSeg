@@ -76,11 +76,10 @@ class CrossAttentionFusion(nn.Module):
             nn.Linear(dim * 4, dim)
         )
 
-    def forward(
-        self,
-        visual_tokens,
-        reasoning_tokens
-    ):
+    def forward(self, visual_tokens, reasoning_tokens):
+        dtype = visual_tokens.dtype
+
+        reasoning_tokens = reasoning_tokens.to(dtype)
 
         attended, _ = self.cross_attn(
             query=visual_tokens,
@@ -88,15 +87,11 @@ class CrossAttentionFusion(nn.Module):
             value=reasoning_tokens
         )
 
-        x = self.norm1(
-            visual_tokens + attended
-        )
+        x = self.norm1(visual_tokens + attended)
 
         ffn_out = self.ffn(x)
 
-        out = self.norm2(
-            x + ffn_out
-        )
+        out = self.norm2(x + ffn_out)
 
         return out
 
@@ -211,9 +206,11 @@ class ReasoningSegmentationModel(nn.Module):
 
         self.vlm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             vlm_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
+            # torch_dtype=torch.bfloat16,
+            device_map=None
         )
+        self.vlm = self.vlm.half()
+        self.vlm = self.vlm.to(device)
 
         # ----------------------------------------------------
         # ADD TOKENS
@@ -261,10 +258,16 @@ class ReasoningSegmentationModel(nn.Module):
         # PROJECTOR
         # ----------------------------------------------------
 
+        # self.projector = nn.Linear(
+        #     hidden_dim,
+        #     sam_dim
+        # ).to(torch.bfloat16)
+
         self.projector = nn.Linear(
             hidden_dim,
             sam_dim
         )
+        self.projector = self.projector.half()
 
         # ----------------------------------------------------
         # CLASS TOKENS
@@ -343,7 +346,10 @@ class ReasoningSegmentationModel(nn.Module):
                 input_ids[b] == token_id
             ).nonzero(as_tuple=True)[0]
 
-            pos = positions[0]
+            if len(positions) == 0:
+                pos = -1
+            else:
+                pos = positions[0]
 
             emb = hidden_states[b, pos]
 
@@ -358,17 +364,14 @@ class ReasoningSegmentationModel(nn.Module):
     # ========================================================
 
     def forward(self, image, prompt):
-
+        image = image.float()
+        dtype = next(self.parameters()).dtype
         # ----------------------------------------------------
         # SAM FEATURES
         # ----------------------------------------------------
 
         with torch.no_grad():
-
-            image_embeddings = self.sam_encoder(
-                image
-            )
-
+            image_embeddings = self.sam_encoder(image.float())
         B, C, H, W = image_embeddings.shape
 
         # ----------------------------------------------------
@@ -376,26 +379,32 @@ class ReasoningSegmentationModel(nn.Module):
         # ----------------------------------------------------
 
         visual_tokens = image_embeddings.flatten(2)
-
         visual_tokens = visual_tokens.transpose(1, 2)
+        visual_tokens = visual_tokens.to(dtype)
 
         # ----------------------------------------------------
         # FULL PROMPT
         # ----------------------------------------------------
 
         full_prompt = (
-            prompt
-            + " "
-            + " ".join(SPECIAL_TOKENS)
+                "<|vision_start|><|image_pad|><|vision_end|>\n"
+                + prompt
+                + " "
+                + " ".join(SPECIAL_TOKENS)
         )
 
         # ----------------------------------------------------
         # VLM INPUT
         # ----------------------------------------------------
 
+        images = [
+            img.permute(1, 2, 0).cpu().numpy()
+            for img in image
+        ]
+
         inputs = self.processor(
             text=[full_prompt] * B,
-            images=list(image),
+            images=images,
             return_tensors="pt",
             padding=True
         )
@@ -415,7 +424,8 @@ class ReasoningSegmentationModel(nn.Module):
         )
 
         hidden_states = outputs.hidden_states[-1]
-
+        hidden_states = hidden_states.half()
+        
         # ----------------------------------------------------
         # CLASS-SPECIFIC MASKS
         # ----------------------------------------------------
@@ -589,7 +599,7 @@ def class_to_id(name):
     return mapping[name]
 # ============================================================
 # FIX 1:
-# RGB MASK → CLASS ID CONVERSION
+# RGB MASK ? CLASS ID CONVERSION
 # ============================================================
 
 COLOR_MAP = {
@@ -672,21 +682,28 @@ class FloodNetDataset(Dataset):
         # RGB MASK
         # ----------------------------------------------------
 
-        mask_rgb = cv2.imread(mask_path)
+        # mask_rgb = cv2.imread(mask_path)
+        #
+        # mask_rgb = cv2.cvtColor(
+        #     mask_rgb,
+        #     cv2.COLOR_BGR2RGB
+        # )
+        #
+        # mask_rgb = cv2.resize(
+        #     mask_rgb,
+        #     (1024, 1024),
+        #     interpolation=cv2.INTER_NEAREST
+        # )
+        #
+        # mask = rgb_to_mask(mask_rgb)
+        #
+        # mask = torch.tensor(mask).long()
 
-        mask_rgb = cv2.cvtColor(
-            mask_rgb,
-            cv2.COLOR_BGR2RGB
-        )
-
-        mask_rgb = cv2.resize(
-            mask_rgb,
-            (1024, 1024),
-            interpolation=cv2.INTER_NEAREST
-        )
-
-        mask = rgb_to_mask(mask_rgb)
-
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        mask = cv2.resize(  mask,
+                            (1024, 1024),
+                            interpolation=cv2.INTER_NEAREST
+                            )
         mask = torch.tensor(mask).long()
 
         return {
@@ -827,7 +844,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, best_loss, save_dir):
             os.path.join(save_dir, "best_model.pt")
         )
 
-        print("✅ Saved best model")
+        print("? Saved best model")
 
     return best_loss
 
@@ -893,15 +910,15 @@ print("Using device:", device)
 # ============================================================
 # DATASET PATHS
 # ============================================================
+main_directory = "/home/exouser/Downloads/FloodNet/FloodNet-Supervised_v1.0"
+train_image_dir = os.path.join(main_directory, "train/train-org-img")
+train_mask_dir = os.path.join(main_directory, "train/train-label-img")
 
-train_image_dir = "/home/ehk224/Downloads/floodnet-seg/FloodNet Challenge - Track 1/Train/Unlabeled/image"
-train_mask_dir = "/home/ehk224/Downloads/floodnet-seg/ColorMasks-FloodNetv1.0/ColorMasks-TrainSet"
+val_image_dir = os.path.join(main_directory, "val/val-org-img")
+val_mask_dir = os.path.join(main_directory, "val/val-label-img")
 
-val_image_dir = "/home/ehk224/Downloads/floodnet-seg/FloodNet Challenge - Track 1/Validation/image"
-val_mask_dir = "/home/ehk224/Downloads/floodnet-seg/ColorMasks-FloodNetv1.0/ColorMasks-ValSet"
-
-test_image_dir = "/home/ehk224/Downloads/floodnet-seg/FloodNet Challenge - Track 1/Test/image"
-test_mask_dir = "/home/ehk224/Downloads/floodnet-seg/ColorMasks-FloodNetv1.0/ColorMasks-TestSet"
+test_image_dir = os.path.join(main_directory, "test/test-org-img")
+test_mask_dir = os.path.join(main_directory, "test/test-label-img")
 
 # ============================================================
 # DATASETS
@@ -1034,19 +1051,3 @@ test(
 )
 
 print("Testing complete")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
