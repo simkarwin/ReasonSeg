@@ -64,7 +64,8 @@ class CrossAttentionFusion(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=heads,
-            batch_first=True
+            batch_first=True,
+            dropout=0.0
         )
 
         self.norm1 = nn.LayerNorm(dim)
@@ -76,10 +77,19 @@ class CrossAttentionFusion(nn.Module):
             nn.Linear(dim * 4, dim)
         )
 
+        self.vis_norm = nn.LayerNorm(dim)
+        self.txt_norm = nn.LayerNorm(dim)
+
     def forward(self, visual_tokens, reasoning_tokens):
         dtype = visual_tokens.dtype
 
         reasoning_tokens = reasoning_tokens.to(dtype)
+
+        visual_tokens = self.vis_norm(visual_tokens)
+        reasoning_tokens = self.txt_norm(reasoning_tokens)
+
+        # print("visual af:", visual_tokens.mean().item(), visual_tokens.std().item())
+        # print("reason af:", reasoning_tokens.mean().item(), reasoning_tokens.std().item())
 
         attended, _ = self.cross_attn(
             query=visual_tokens,
@@ -156,14 +166,22 @@ class MaskDecoder(nn.Module):
         super().__init__()
 
         self.decoder = nn.Sequential(
-
             nn.Conv2d(dim, dim, 3, padding=1),
             nn.GELU(),
 
-            nn.Conv2d(dim, dim, 3, padding=1),
+            nn.ConvTranspose2d(dim, dim // 2, 2, stride=2),
             nn.GELU(),
 
-            nn.Conv2d(dim, 1, 1)
+            nn.ConvTranspose2d(dim // 2, dim // 4, 2, stride=2),
+            nn.GELU(),
+
+            nn.ConvTranspose2d(dim // 4, dim // 8, 2, stride=2),
+            nn.GELU(),
+
+            nn.ConvTranspose2d(dim // 8, dim // 16, 2, stride=2),
+            nn.GELU(),
+
+            nn.Conv2d(dim // 16, 1, 1)
         )
 
     def forward(self, x):
@@ -209,7 +227,7 @@ class ReasoningSegmentationModel(nn.Module):
             # torch_dtype=torch.bfloat16,
             device_map=None
         )
-        self.vlm = self.vlm.half()
+        self.vlm = self.vlm
         self.vlm = self.vlm.to(device)
 
         # ----------------------------------------------------
@@ -239,7 +257,10 @@ class ReasoningSegmentationModel(nn.Module):
                 "q_proj",
                 "k_proj",
                 "v_proj",
-                "o_proj"
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj"
             ]
         )
 
@@ -267,7 +288,7 @@ class ReasoningSegmentationModel(nn.Module):
             hidden_dim,
             sam_dim
         )
-        self.projector = self.projector.half()
+        # self.projector = self.projector
 
         # ----------------------------------------------------
         # CLASS TOKENS
@@ -317,9 +338,16 @@ class ReasoningSegmentationModel(nn.Module):
                 CrossAttentionFusion(sam_dim)
             )
 
-            self.mask_decoders[class_name] = (
-                MaskDecoder(sam_dim)
-            )
+        self.mask_decoder = MaskDecoder(sam_dim)
+
+        # ----------------------------------------------------
+        # decoder BLOCKS
+        # ----------------------------------------------------
+        self.class_embed = nn.Embedding(len(self.token_mapping), sam_dim)
+
+        self.vlm = self.vlm.float()
+        self.projector = self.projector.float()
+        self.class_embed = self.class_embed.float()
 
     # ========================================================
     # SAFE TOKEN EXTRACTION
@@ -348,6 +376,7 @@ class ReasoningSegmentationModel(nn.Module):
 
             if len(positions) == 0:
                 pos = -1
+                raise ValueError(f"Token {token} not found")
             else:
                 pos = positions[0]
 
@@ -397,10 +426,18 @@ class ReasoningSegmentationModel(nn.Module):
         # VLM INPUT
         # ----------------------------------------------------
 
-        images = [
-            img.permute(1, 2, 0).cpu().numpy()
-            for img in image
-        ]
+        images = []
+
+        for img in image:
+            img_qwen = F.interpolate(
+                img.unsqueeze(0),
+                size=(400, 400),
+                mode="bilinear",
+                align_corners=False
+            )[0]
+            images.append(
+                img_qwen.permute(1, 2, 0).cpu().numpy()
+            )
 
         inputs = self.processor(
             text=[full_prompt] * B,
@@ -424,8 +461,11 @@ class ReasoningSegmentationModel(nn.Module):
         )
 
         hidden_states = outputs.hidden_states[-1]
-        hidden_states = hidden_states.half()
-        
+        if torch.isnan(hidden_states).any():
+            print("NaN detected in VLM hidden states")
+            exit()
+        # hidden_states = hidden_states.half()
+
         # ----------------------------------------------------
         # CLASS-SPECIFIC MASKS
         # ----------------------------------------------------
@@ -433,81 +473,49 @@ class ReasoningSegmentationModel(nn.Module):
         masks = {}
 
         for class_name, token in self.token_mapping.items():
-
-            # --------------------------------------------
-            # TOKEN EMBEDDING
-            # --------------------------------------------
-
             token_embedding = self.extract_token_embedding(
                 hidden_states,
                 inputs["input_ids"],
                 token
             )
 
-            token_embedding = self.projector(
-                token_embedding
-            )
-
+            token_embedding = self.projector(token_embedding)
             token_embedding = token_embedding.unsqueeze(1)
 
-            # --------------------------------------------
-            # CROSS ATTENTION
-            # --------------------------------------------
+            # print("visual df:", visual_tokens.mean().item(), visual_tokens.std().item())
+            # print("reason df:", token_embedding.mean().item(), token_embedding.std().item())
 
             fused = self.fusion_blocks[class_name](
                 visual_tokens,
                 token_embedding
             )
 
-            # --------------------------------------------
-            # RESTORE SPATIAL
-            # --------------------------------------------
-
             fused = fused.transpose(1, 2)
+            fused = fused.reshape(B, C, H, W)
 
-            fused = fused.reshape(
-                B,
-                C,
-                H,
-                W
-            )
+            # ----------------------------
+            # ADD CLASS CONDITIONING
+            # ----------------------------
 
-            # --------------------------------------------
-            # CLASS DECODER
-            # --------------------------------------------
+            class_idx = list(self.token_mapping.keys()).index(class_name)
+            class_idx = torch.tensor(class_idx, device=fused.device)
 
-            masks[class_name] = (
-                self.mask_decoders[class_name](fused)
-            )
+            class_vec = self.class_embed(class_idx)
+            class_vec = class_vec.view(1, C, 1, 1)
+
+            fused = fused + class_vec
+
+            # ----------------------------
+            # SHARED DECODER
+            # ----------------------------
+
+            masks[class_name] = self.mask_decoder(fused)
 
         return masks
 
 # ============================================================
 # LOSSES
 # ============================================================
-
-def dice_loss(
-    pred,
-    target,
-    smooth=1e-6
-):
-
-    pred = torch.sigmoid(pred)
-
-    intersection = (
-        pred * target
-    ).sum()
-
-    union = pred.sum() + target.sum()
-
-    dice = (
-        2 * intersection + smooth
-    ) / (
-        union + smooth
-    )
-
-    return 1 - dice
-
 
 def segmentation_loss(
     predictions,
@@ -537,15 +545,18 @@ def segmentation_loss(
     return total_loss
 
 
-
 def dice_loss(pred, target, smooth=1e-6):
+    pred = torch.sigmoid(torch.clamp(pred, -10, 10))
 
-    pred = torch.sigmoid(pred)
+    pred = pred.flatten(1)
+    target = target.flatten(1)
 
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum()
+    intersection = (pred * target).sum(dim=1)
+    union = pred.sum(dim=1) + target.sum(dim=1)
 
-    return 1 - (2 * intersection + smooth) / (union + smooth)
+    dice = (2 * intersection + smooth) / (union + smooth)
+
+    return 1 - dice.mean()
 
 
 def total_loss(preds, masks):
@@ -714,29 +725,30 @@ class FloodNetDataset(Dataset):
 
 
 
-def train_one_epoch(model, loader, optimizer, device):
+def train_one_epoch(model, loader, optimizer, device, save_vis_dir=None):
 
     model.train()
 
     total_loss = 0
+    total_dice = 0
 
-    for batch in tqdm(loader):
+    for i, batch in enumerate(tqdm(loader)):
 
         image = batch["image"].to(device)
         mask = batch["mask"].to(device)
 
-        prompt = (
-            "Segment flooded buildings, roads, water, and vegetation. "
-        )
+        prompt = "Segment flooded buildings, roads, water, and vegetation."
 
         preds = model(image, prompt)
 
         loss = 0
 
+        # combine all classes for visualization
+        pred_class_masks = []
+
         for key in preds:
 
             pred = preds[key]
-
             target = (mask == class_to_id(key)).float().unsqueeze(1)
 
             loss += (
@@ -744,33 +756,60 @@ def train_one_epoch(model, loader, optimizer, device):
                 + dice_loss(pred, target)
             )
 
+            pred_class_masks.append(torch.sigmoid(pred))
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
 
+        # ---- metrics (example: aggregate first class or mean) ----
+        pred_mask = torch.argmax(torch.cat(pred_class_masks, dim=1), dim=1)
+        gt_mask = mask
+
+        dice = dice_score(pred_mask.float(), gt_mask.float())
+        total_dice += dice.item()
+
+        # ---- save sample visualization every N steps ----
+        if save_vis_dir and i % 50 == 0:
+            os.makedirs(save_vis_dir, exist_ok=True)
+
+            save_visualization(
+                image[0],
+                gt_mask[0],
+                pred_mask[0],
+                os.path.join(save_vis_dir, f"train_{i}.png")
+            )
+
+        if i > 0 and i % 10 == 0:
+            break
+
+    print(f"Train Loss: {total_loss/len(loader):.4f} | Dice: {total_dice/len(loader):.4f}")
+
     return total_loss / len(loader)
 
-
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, save_vis_dir=None):
 
     model.eval()
 
     total_loss = 0
+    total_dice = 0
+    total_iou = 0
 
     with torch.no_grad():
 
-        for batch in loader:
+        for i, batch in enumerate(loader):
 
             image = batch["image"].to(device)
             mask = batch["mask"].to(device)
 
-            prompt = "Segment flooded buildings and roads."
+            prompt = "Segment flooded buildings, roads, water, and vegetation."
 
             preds = model(image, prompt)
 
             loss = 0
+            pred_class_masks = []
 
             for key in preds:
 
@@ -782,10 +821,35 @@ def evaluate(model, loader, device):
                     + dice_loss(pred, target)
                 )
 
+                pred_class_masks.append(torch.sigmoid(pred))
+
             total_loss += loss.item()
 
-    return total_loss / len(loader)
+            pred_mask = torch.argmax(torch.cat(pred_class_masks, dim=1), dim=1)
 
+            dice = dice_score(pred_mask.float(), mask.float())
+            iou = iou_score(pred_mask.float(), mask.float())
+
+            total_dice += dice.item()
+            total_iou += iou.item()
+
+            if save_vis_dir and i % 20 == 0:
+                os.makedirs(save_vis_dir, exist_ok=True)
+
+                save_visualization(
+                    image[0],
+                    mask[0],
+                    pred_mask[0],
+                    os.path.join(save_vis_dir, f"eval_{i}.png")
+                )
+
+    print(
+        f"Eval Loss: {total_loss/len(loader):.4f} | "
+        f"Dice: {total_dice/len(loader):.4f} | "
+        f"IoU: {total_iou/len(loader):.4f}"
+    )
+
+    return total_loss / len(loader)
 
 
 def test(model, loader, device, save_dir):
@@ -806,25 +870,79 @@ def test(model, loader, device, save_dir):
 
             preds = model(image, prompt)
 
-            fused = None
+            pred_stack = []
 
             for key in preds:
+                pred = torch.sigmoid(
+                    preds[key]
+                )
 
-                pred = torch.sigmoid(preds[key])[0, 0].cpu().numpy()
+                pred_stack.append(pred)
 
-                if fused is None:
-                    fused = pred
-                else:
-                    fused += pred
+            pred_stack = torch.cat(
+                pred_stack,
+                dim=1
+            )
 
-            fused = fused / len(preds)
+            final_mask = torch.argmax(
+                pred_stack,
+                dim=1
+            )
 
-            fused = (fused > 0.5).astype(np.uint8) * 255
+            fused = final_mask[0].cpu().numpy().astype(np.uint8)
 
             cv2.imwrite(
                 os.path.join(save_dir, f"pred_{i}.png"),
                 fused
             )
+
+
+import matplotlib.pyplot as plt
+
+def save_visualization(image, gt_mask, pred_mask, save_path):
+    """
+    image: (3, H, W) tensor
+    gt_mask: (H, W)
+    pred_mask: (H, W)
+    """
+
+    image = image.detach().cpu().permute(1, 2, 0).numpy()
+    image = (image - image.min()) / (image.max() - image.min() + 1e-8)
+
+    gt_mask = gt_mask.cpu().numpy()
+    pred_mask = pred_mask.cpu().numpy()
+
+    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+
+    axs[0].imshow(image)
+    axs[0].set_title("Input")
+    axs[0].axis("off")
+
+    axs[1].imshow(gt_mask, cmap="gray")
+    axs[1].set_title("Ground Truth")
+    axs[1].axis("off")
+
+    axs[2].imshow(pred_mask, cmap="gray")
+    axs[2].set_title("Prediction")
+    axs[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+
+def dice_score(pred, target, eps=1e-6):
+    pred = (pred > 0.5).float()
+    inter = (pred * target).sum()
+    return (2. * inter + eps) / (pred.sum() + target.sum() + eps)
+
+
+def iou_score(pred, target, eps=1e-6):
+    pred = (pred > 0.5).float()
+    inter = (pred * target).sum()
+    union = pred.sum() + target.sum() - inter
+    return (inter + eps) / (union + eps)
+
 
 def save_checkpoint(model, optimizer, epoch, val_loss, best_loss, save_dir):
 
@@ -854,6 +972,7 @@ def train_model(
     train_loader,
     val_loader,
     optimizer,
+    scheduler,
     device,
     epochs=50,
     save_dir="checkpoints"
@@ -883,14 +1002,16 @@ def train_model(
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Loss: {val_loss:.4f}")
 
-        best_loss = save_checkpoint(
-            model,
-            optimizer,
-            epoch,
-            val_loss,
-            best_loss,
-            save_dir
-        )
+        scheduler.step()
+
+        # best_loss = save_checkpoint(
+        #     model,
+        #     optimizer,
+        #     epoch,
+        #     val_loss,
+        #     best_loss,
+        #     save_dir
+        # )
 
 
 
@@ -1006,10 +1127,13 @@ optimizer = optim.AdamW(
         lambda p: p.requires_grad,
         model.parameters()
     ),
-    lr=1e-4,
+    lr=1e-5,
     weight_decay=1e-4
 )
-
+scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=50
+)
 # ============================================================
 # TRAIN
 # ============================================================
@@ -1019,6 +1143,7 @@ train_model(
     train_loader=train_loader,
     val_loader=val_loader,
     optimizer=optimizer,
+    scheduler=scheduler,
     device=device,
     epochs=50,
     save_dir="checkpoints"
