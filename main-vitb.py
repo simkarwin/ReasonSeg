@@ -398,9 +398,11 @@ class ReasoningSegmentationModel(nn.Module):
         # ----------------------------------------------------
         # SAM FEATURES
         # ----------------------------------------------------
-
+        # image = image.float()
+        # image = (image - 0.5) / 0.5
+        # image = F.interpolate(image, size=(512, 512), mode="bilinear", align_corners=False)
         with torch.no_grad():
-            image_embeddings = self.sam_encoder(image.float())
+            image_embeddings = self.sam_encoder(image)
         B, C, H, W = image_embeddings.shape
 
         # ----------------------------------------------------
@@ -782,8 +784,8 @@ def train_one_epoch(model, loader, optimizer, device, save_vis_dir=None):
                 os.path.join(save_vis_dir, f"train_{i}.png")
             )
 
-        if i > 0 and i % 10 == 0:
-            break
+        # if i > 0 and i % 10 == 0:
+        #     break
 
     print(f"Train Loss: {total_loss/len(loader):.4f} | Dice: {total_dice/len(loader):.4f}")
 
@@ -1095,8 +1097,11 @@ test_loader = DataLoader(
 
 from segment_anything import sam_model_registry
 
-sam_checkpoint = "sam_vit_h_4b8939.pth"
-model_type = "vit_h"
+# sam_checkpoint = "sam_vit_h_4b8939.pth"
+# model_type = "vit_h"
+
+model_type = "vit_b"
+sam_checkpoint = "sam_vit_b_01ec64.pth"
 
 sam = sam_model_registry[model_type](
     checkpoint=sam_checkpoint
